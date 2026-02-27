@@ -1,0 +1,25 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# conda
+.env/
+venv/
+
+# mac
+.DS_Store
+
+# outputs
+outputs/
+*.log
+
+# pytorch
+*.pt
+
+# cursor / vscode
+.vscode/
+.cursor/
+
+# notebook
+.ipynb_checkpoints/
