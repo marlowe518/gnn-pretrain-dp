@@ -1,0 +1,18 @@
+{
+  "dataset": "Cora",
+  "hidden_dim": 64,
+
+  "learning_rate_pretrain": 0.001,
+  "learning_rate_finetune": 0.01,
+  "weight_decay": 0.0005,
+
+  "pretrain_epochs": 50,
+  "finetune_epochs": 200,
+  "smoke_pretrain_epochs": 2,
+  "smoke_finetune_epochs": 5,
+
+  "gap_epsilon": 1.0,
+  "gap_delta": 1e-5,
+  "gap_hops": 2
+}
+
