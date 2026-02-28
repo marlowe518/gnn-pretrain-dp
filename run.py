@@ -14,6 +14,11 @@ from src.models.dgi import build_dgi_model
 from src.pretrain.dgi_trainer import DGIPretrainer
 from src.utils.config import load_config, save_config
 
+try:
+    from src.dp.gap_trainer import GAPFinetuneTrainer
+except Exception:
+    GAPFinetuneTrainer = None
+
 
 def set_seeds(seed: int) -> None:
     random.seed(seed)
@@ -53,7 +58,7 @@ def create_logger(log_path: Path):
 
 def run_dry_run(
     pretrainer: DGIPretrainer,
-    finetune_trainer: NodeClassificationTrainer,
+    finetune_trainer,
     logger,
 ) -> None:
     logger("Running dry run (1 DGI step + 1 classifier step).")
@@ -67,7 +72,7 @@ def run_dry_run(
 def run_training_and_eval(
     mode: str,
     pretrainer: DGIPretrainer,
-    finetune_trainer: NodeClassificationTrainer,
+    finetune_trainer,
     pretrain_epochs: int,
     finetune_epochs: int,
     logger,
@@ -117,6 +122,12 @@ def main():
     parser.add_argument("--config", type=str, default=None, help="Path to JSON config.")
     parser.add_argument("--run_id", type=str, default=None, help="Optional run id.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument(
+        "--finetune_backend",
+        choices=["vanilla", "gap"],
+        default="vanilla",
+        help="Finetuning backend: vanilla (standard) or gap (DP via Graph Aggregation Perturbation).",
+    )
 
     args = parser.parse_args()
 
@@ -130,7 +141,7 @@ def main():
     logger = create_logger(log_path)
 
     logger(f"Run directory: {run_dir}")
-    logger(f"Mode={args.mode}, dry_run={args.dry_run}, smoke_test={args.smoke_test}")
+    logger(f"Mode={args.mode}, dry_run={args.dry_run}, smoke_test={args.smoke_test}, finetune_backend={args.finetune_backend}")
 
     # Load config and resolve epoch counts based on mode.
     config = load_config(args.config)
@@ -176,15 +187,31 @@ def main():
         logger=logger,
     )
 
-    finetune_trainer = NodeClassificationTrainer(
-        encoder=encoder,
-        num_classes=num_classes,
-        data=data,
-        lr=float(config.get("learning_rate_finetune", 1e-2)),
-        weight_decay=float(config.get("weight_decay", 5e-4)),
-        device=device,
-        logger=logger,
-    )
+    if args.finetune_backend == "gap":
+        if GAPFinetuneTrainer is None:
+            raise RuntimeError("GAP backend requested but src.dp.gap_trainer could not be loaded (check external/GAP and dependencies).")
+        finetune_trainer = GAPFinetuneTrainer(
+            encoder=encoder,
+            num_classes=num_classes,
+            data=data,
+            lr=float(config.get("learning_rate_finetune", 1e-2)),
+            weight_decay=float(config.get("weight_decay", 5e-4)),
+            device=device,
+            logger=logger,
+            epsilon=float(config.get("gap_epsilon", 1.0)),
+            delta=config.get("gap_delta", "auto"),
+            hops=int(config.get("gap_hops", 2)),
+        )
+    else:
+        finetune_trainer = NodeClassificationTrainer(
+            encoder=encoder,
+            num_classes=num_classes,
+            data=data,
+            lr=float(config.get("learning_rate_finetune", 1e-2)),
+            weight_decay=float(config.get("weight_decay", 5e-4)),
+            device=device,
+            logger=logger,
+        )
 
     if args.dry_run:
         run_dry_run(pretrainer, finetune_trainer, logger)
