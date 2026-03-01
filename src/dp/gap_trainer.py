@@ -193,6 +193,8 @@ class GAPFinetuneTrainer(BaseTrainer):
             print("z_noisy", z_noisy)
             z_clean_norm = F.normalize(z_clean, p=2, dim=-1)
             z_noisy_norm = F.normalize(z_noisy, p=2, dim=-1)
+            print("z_clean_norm", z_clean_norm)
+            print("z_noisy_norm", z_noisy_norm)
 
             clean_list.append(z_clean_norm)
             noisy_list.append(z_noisy_norm)
