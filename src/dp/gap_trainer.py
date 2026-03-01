@@ -135,7 +135,7 @@ class GAPFinetuneTrainer(BaseTrainer):
             # Optional resampling sanity check: privatize twice without
             # affecting RNG state seen by the main path.
             if self.gap_debug_resample_check and not self._debug_resample_done:
-                import torch.cuda
+                # import torch.cuda
 
                 cpu_state = torch.random.get_rng_state()
                 cuda_states = None
