@@ -189,6 +189,8 @@ class GAPFinetuneTrainer(BaseTrainer):
                     )
 
             # Normalize both clean and noisy aggregations for comparison.
+            print("z_clean", z_clean)
+            print("z_noisy", z_noisy)
             z_clean_norm = F.normalize(z_clean, p=2, dim=-1)
             z_noisy_norm = F.normalize(z_noisy, p=2, dim=-1)
 
