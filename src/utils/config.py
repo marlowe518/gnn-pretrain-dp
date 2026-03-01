@@ -18,16 +18,23 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "vat_eps": 1e-2,
     "vat_xi": 1e-6,
     "vat_ip": 1,
+    # GAP DP finetuning (when finetune_backend=gap)
+    "gap_epsilon": 1.0,
+    "gap_delta": "auto",
+    "gap_hops": 2,
+    "gap_debug": False,
 }
 
 
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     """
     Load JSON config from disk and merge with defaults.
+    If config_path is given, it is resolved to an absolute path so the same
+    file is used regardless of later cwd changes.
     """
     config = dict(DEFAULT_CONFIG)
     if config_path is not None:
-        path = Path(config_path)
+        path = Path(config_path).resolve()
         with path.open("r") as f:
             disk_cfg = json.load(f)
         config.update(disk_cfg)

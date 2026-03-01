@@ -139,6 +139,21 @@ def main():
         default="vanilla",
         help="Finetuning backend: vanilla (standard) or gap (DP via Graph Aggregation Perturbation).",
     )
+    parser.add_argument(
+        "--gap_debug",
+        action="store_true",
+        help="Enable extra GAP DP debug logging and checks.",
+    )
+    parser.add_argument(
+        "--gap_debug_strict",
+        action="store_true",
+        help="Treat GAP debug checks as hard assertions (may raise errors).",
+    )
+    parser.add_argument(
+        "--gap_debug_resample_check",
+        action="store_true",
+        help="Run additional GAP resampling sanity check (debug-only, cheap).",
+    )
 
     args = parser.parse_args()
 
@@ -159,10 +174,23 @@ def main():
     )
 
     # Load config and resolve epoch counts based on mode.
+    if args.config is not None:
+        from pathlib import Path as _Path
+
+        config_path_abs = _Path(args.config).resolve()
+        logger(f"Loaded config file: {config_path_abs}")
+    else:
+        config_path_abs = None
+
     config = load_config(args.config)
     config["seed"] = args.seed
     config_path = save_config(config, run_dir)
     logger(f"Config saved to {config_path}")
+
+    # Effective GAP debug flags (finetune_backend may still be non-GAP).
+    gap_debug = bool(args.gap_debug or config.get("gap_debug", False))
+    gap_debug_strict = bool(args.gap_debug_strict)
+    gap_debug_resample_check = bool(args.gap_debug_resample_check)
 
     if args.smoke_test:
         pretrain_epochs = int(config.get("smoke_pretrain_epochs", 2))
@@ -221,6 +249,15 @@ def main():
     if args.finetune_backend == "gap":
         if GAPFinetuneTrainer is None:
             raise RuntimeError("GAP backend requested but src.dp.gap_trainer could not be loaded (check external/GAP and dependencies).")
+        gap_epsilon = float(config.get("gap_epsilon", 1.0))
+        gap_delta = config.get("gap_delta", "auto")
+        gap_hops = int(config.get("gap_hops", 2))
+        if gap_debug:
+            logger(
+                "[GAP-DEBUG] "
+                f"epsilon={gap_epsilon}, delta={gap_delta}, hops={gap_hops}, "
+                f"config_path={config_path_abs}"
+            )
         finetune_trainer = GAPFinetuneTrainer(
             encoder=encoder,
             num_classes=num_classes,
@@ -229,9 +266,12 @@ def main():
             weight_decay=float(config.get("weight_decay", 5e-4)),
             device=device,
             logger=logger,
-            epsilon=float(config.get("gap_epsilon", 1.0)),
-            delta=config.get("gap_delta", "auto"),
-            hops=int(config.get("gap_hops", 2)),
+            epsilon=gap_epsilon,
+            delta=gap_delta,
+            hops=gap_hops,
+            gap_debug=gap_debug,
+            gap_debug_strict=gap_debug_strict,
+            gap_debug_resample_check=gap_debug_resample_check,
         )
     else:
         finetune_trainer = NodeClassificationTrainer(
