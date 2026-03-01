@@ -13,6 +13,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "finetune_epochs": 200,
     "smoke_pretrain_epochs": 2,
     "smoke_finetune_epochs": 5,
+    # VAT-related defaults (for DGI+VAT pretraining backend)
+    "vat_lambda": 1.0,
+    "vat_eps": 1e-2,
+    "vat_xi": 1e-6,
+    "vat_ip": 1,
 }
 
 

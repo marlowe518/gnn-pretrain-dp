@@ -12,6 +12,7 @@ from src.data.datasets import add_or_load_splits, load_planetoid
 from src.finetune.node_classifier_trainer import NodeClassificationTrainer
 from src.models.dgi import build_dgi_model
 from src.pretrain.dgi_trainer import DGIPretrainer
+from src.pretrain.dgi_vat_trainer import DGIVATPretrainer
 from src.utils.config import load_config, save_config
 
 try:
@@ -57,11 +58,11 @@ def create_logger(log_path: Path):
 
 
 def run_dry_run(
-    pretrainer: DGIPretrainer,
+    pretrainer,
     finetune_trainer,
     logger,
 ) -> None:
-    logger("Running dry run (1 DGI step + 1 classifier step).")
+    logger("Running dry run (1 pretrain step + 1 classifier step).")
     pre_info = pretrainer.dry_run_debug_step()
     fin_info = finetune_trainer.dry_run_debug_step()
     logger(f"[dry] DGI loss={pre_info['pretrain_loss']:.4f}, grad_norm={pre_info['grad_norm']:.4f}")
@@ -71,16 +72,20 @@ def run_dry_run(
 
 def run_training_and_eval(
     mode: str,
-    pretrainer: DGIPretrainer,
+    pretrainer,
     finetune_trainer,
     pretrain_epochs: int,
     finetune_epochs: int,
     logger,
+    pretrain_backend: str,
 ) -> Dict[str, Any]:
     metrics: Dict[str, Any] = {}
 
     if mode in ("pretrain", "full"):
-        logger(f"Starting DGI pretraining for {pretrain_epochs} epochs.")
+        logger(
+            f"Starting pretraining backend={pretrain_backend} "
+            f"for {pretrain_epochs} epochs."
+        )
         pre_metrics = pretrainer.train(pretrain_epochs)
         metrics["pretrain"] = pre_metrics
 
@@ -123,6 +128,12 @@ def main():
     parser.add_argument("--run_id", type=str, default=None, help="Optional run id.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument(
+        "--pretrain_backend",
+        choices=["dgi", "dgi_vat"],
+        default="dgi",
+        help="Pretraining backend: dgi (Deep Graph Infomax) or dgi_vat (DGI + VAT).",
+    )
+    parser.add_argument(
         "--finetune_backend",
         choices=["vanilla", "gap"],
         default="vanilla",
@@ -141,7 +152,11 @@ def main():
     logger = create_logger(log_path)
 
     logger(f"Run directory: {run_dir}")
-    logger(f"Mode={args.mode}, dry_run={args.dry_run}, smoke_test={args.smoke_test}, finetune_backend={args.finetune_backend}")
+    logger(
+        f"Mode={args.mode}, dry_run={args.dry_run}, smoke_test={args.smoke_test}, "
+        f"pretrain_backend={args.pretrain_backend}, "
+        f"finetune_backend={args.finetune_backend}"
+    )
 
     # Load config and resolve epoch counts based on mode.
     config = load_config(args.config)
@@ -178,14 +193,30 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger(f"Using device: {device}")
 
-    pretrainer = DGIPretrainer(
-        model=dgi_model,
-        data=data,
-        lr=float(config.get("learning_rate_pretrain", 1e-3)),
-        weight_decay=float(config.get("weight_decay", 5e-4)),
-        device=device,
-        logger=logger,
-    )
+    if args.pretrain_backend == "dgi_vat":
+        pretrainer = DGIVATPretrainer(
+            model=dgi_model,
+            encoder=encoder,
+            data=data,
+            num_classes=num_classes,
+            lr=float(config.get("learning_rate_pretrain", 1e-3)),
+            weight_decay=float(config.get("weight_decay", 5e-4)),
+            device=device,
+            logger=logger,
+            vat_lambda=float(config.get("vat_lambda", 1.0)),
+            vat_eps=float(config.get("vat_eps", 1e-2)),
+            vat_xi=float(config.get("vat_xi", 1e-6)),
+            vat_ip=int(config.get("vat_ip", 1)),
+        )
+    else:
+        pretrainer = DGIPretrainer(
+            model=dgi_model,
+            data=data,
+            lr=float(config.get("learning_rate_pretrain", 1e-3)),
+            weight_decay=float(config.get("weight_decay", 5e-4)),
+            device=device,
+            logger=logger,
+        )
 
     if args.finetune_backend == "gap":
         if GAPFinetuneTrainer is None:
@@ -224,6 +255,7 @@ def main():
         pretrain_epochs=pretrain_epochs,
         finetune_epochs=finetune_epochs,
         logger=logger,
+        pretrain_backend=args.pretrain_backend,
     )
 
     metrics_path = run_dir / "metrics.json"
