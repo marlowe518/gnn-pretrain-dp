@@ -25,17 +25,26 @@ class NodeClassificationTrainer(BaseTrainer):
         weight_decay: float,
         device: torch.device,
         logger: Optional[callable] = None,
+        *,
+        train_encoder: bool = True,
     ) -> None:
         self.encoder = encoder.to(device)
+        self.train_encoder = train_encoder
         hidden_dim = encoder.conv2.out_channels
         self.classifier = nn.Linear(hidden_dim, num_classes).to(device)
         self.data = data.to(device)
         self.device = device
-        self.optimizer = Adam(
-            list(self.encoder.parameters()) + list(self.classifier.parameters()),
-            lr=lr,
-            weight_decay=weight_decay,
-        )
+        if not self.train_encoder:
+            self.encoder.eval()
+            for p in self.encoder.parameters():
+                p.requires_grad = False
+            self.optimizer = Adam(self.classifier.parameters(), lr=lr, weight_decay=weight_decay)
+        else:
+            self.optimizer = Adam(
+                list(self.encoder.parameters()) + list(self.classifier.parameters()),
+                lr=lr,
+                weight_decay=weight_decay,
+            )
         self.logger = logger
         self._last_train_loss: float = 0.0
 
@@ -44,9 +53,14 @@ class NodeClassificationTrainer(BaseTrainer):
             self.logger(msg)
 
     def _forward_logits(self) -> Tensor:
-        self.encoder.train()
         self.classifier.train()
-        z = self.encoder(self.data.x, self.data.edge_index)
+        if self.train_encoder:
+            self.encoder.train()
+            z = self.encoder(self.data.x, self.data.edge_index)
+        else:
+            self.encoder.eval()
+            with torch.no_grad():
+                z = self.encoder(self.data.x, self.data.edge_index)
         logits = self.classifier(z)
         return logits
 
@@ -94,11 +108,18 @@ class NodeClassificationTrainer(BaseTrainer):
         """
         Single forward/backward step with shape + grad norm diagnostics.
         """
-        self.encoder.train()
+        if self.train_encoder:
+            self.encoder.train()
+        else:
+            self.encoder.eval()
         self.classifier.train()
         self.optimizer.zero_grad()
 
-        z = self.encoder(self.data.x, self.data.edge_index)
+        if self.train_encoder:
+            z = self.encoder(self.data.x, self.data.edge_index)
+        else:
+            with torch.no_grad():
+                z = self.encoder(self.data.x, self.data.edge_index)
         logits = self.classifier(z)
         train_mask = self.data.train_mask
         loss = F.cross_entropy(logits[train_mask], self.data.y[train_mask])
@@ -113,7 +134,7 @@ class NodeClassificationTrainer(BaseTrainer):
 
         total_norm_sq: Tensor = torch.tensor(0.0, device=self.device)
         for p in list(self.encoder.parameters()) + list(self.classifier.parameters()):
-            if p.grad is None:
+            if not p.requires_grad or p.grad is None:
                 continue
             total_norm_sq += p.grad.detach().pow(2).sum()
         grad_norm = float(total_norm_sq.sqrt().item())

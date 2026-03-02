@@ -38,11 +38,14 @@ class GAPFinetuneTrainer(BaseTrainer):
         gap_debug: bool = False,
         gap_debug_strict: bool = False,
         gap_debug_resample_check: bool = False,
+        train_encoder: bool = False,
     ) -> None:
         self.encoder = encoder.to(device)
-        self.encoder.eval()
-        for p in self.encoder.parameters():
-            p.requires_grad = False
+        self.train_encoder = bool(train_encoder)
+        if not self.train_encoder:
+            self.encoder.eval()
+            for p in self.encoder.parameters():
+                p.requires_grad = False
         self.data = data.to(device)
         self.device = device
         self.logger = logger
@@ -73,7 +76,14 @@ class GAPFinetuneTrainer(BaseTrainer):
             self.logger(f"[GAP] PMA calibrated: epsilon={epsilon}, delta={delta_val}, noise_scale={self.pma.noise_scale:.4f}")
 
         self.classifier = nn.Linear((hops + 1) * hidden_dim, num_classes).to(device)
-        self.optimizer = Adam(self.classifier.parameters(), lr=lr, weight_decay=weight_decay)
+        if self.train_encoder:
+            self.optimizer = Adam(
+                list(self.encoder.parameters()) + list(self.classifier.parameters()),
+                lr=lr,
+                weight_decay=weight_decay,
+            )
+        else:
+            self.optimizer = Adam(self.classifier.parameters(), lr=lr, weight_decay=weight_decay)
 
     def _log(self, msg: str) -> None:
         if self.logger is not None:
@@ -91,11 +101,17 @@ class GAPFinetuneTrainer(BaseTrainer):
         else:
             print(prefix + msg)
 
-    def _compute_aggregations(self) -> Tensor:
-        """Encoder forward + multi-hop aggregation with PMA. Returns [n, hidden_dim, hops+1]."""
-        self.encoder.eval()
-        with torch.no_grad():
+    def _compute_aggregations(self, use_grad: bool = False) -> Tensor:
+        """Encoder forward + multi-hop aggregation with PMA. Returns [n, hidden_dim, hops+1].
+        When use_grad=True and train_encoder, gradients flow through encoder.
+        """
+        if use_grad and self.train_encoder:
+            self.encoder.train()
             x = self.encoder(self.data.x, self.data.edge_index)
+        else:
+            self.encoder.eval()
+            with torch.no_grad():
+                x = self.encoder(self.data.x, self.data.edge_index)
         x = F.normalize(x, p=2, dim=-1)
         n = x.size(0)
         edge_index = self.data.edge_index
@@ -201,8 +217,12 @@ class GAPFinetuneTrainer(BaseTrainer):
         return torch.stack(noisy_list, dim=-1)
 
     def _get_aggregated_features(self) -> Tensor:
+        if self.train_encoder and (self.encoder.training or self.classifier.training):
+            return self._compute_aggregations(use_grad=True)
+        if self.train_encoder:
+            return self._compute_aggregations(use_grad=False)
         if self._aggregated_x is None:
-            self._aggregated_x = self._compute_aggregations()
+            self._aggregated_x = self._compute_aggregations(use_grad=False)
         return self._aggregated_x
 
     def _forward_logits(self) -> Tensor:
@@ -238,7 +258,11 @@ class GAPFinetuneTrainer(BaseTrainer):
         return self.classifier(flat)
 
     def _step(self) -> float:
+        if self.train_encoder:
+            self._aggregated_x = None
         self.classifier.train()
+        if self.train_encoder:
+            self.encoder.train()
         self.optimizer.zero_grad()
         logits = self._forward_logits()
         train_mask = self.data.train_mask
@@ -250,8 +274,11 @@ class GAPFinetuneTrainer(BaseTrainer):
 
     def train(self, num_epochs: int) -> Dict[str, float]:
         self._aggregated_x = None
-        self._aggregated_x = self._compute_aggregations()
-        self._log(f"[GAP] Aggregations computed (hops={self.hops}, PMA applied). Training classifier.")
+        if not self.train_encoder:
+            self._aggregated_x = self._compute_aggregations(use_grad=False)
+            self._log(f"[GAP] Aggregations computed (hops={self.hops}, PMA applied). Training classifier.")
+        else:
+            self._log(f"[GAP] Full finetuning (encoder + classifier). Aggregations recomputed each step.")
         last_loss = 0.0
         train_metrics = {}
         val_metrics = {}
@@ -273,6 +300,8 @@ class GAPFinetuneTrainer(BaseTrainer):
 
     def evaluate(self, split: str) -> Dict[str, float]:
         self.classifier.eval()
+        if self.train_encoder:
+            self.encoder.eval()
         mask = getattr(self.data, f"{split}_mask")
         with torch.no_grad():
             logits = self._forward_logits()
@@ -282,22 +311,29 @@ class GAPFinetuneTrainer(BaseTrainer):
         return {"accuracy": acc}
 
     def dry_run_debug_step(self) -> Dict[str, float]:
-        """Single forward/backward step for dry_run; encoder is frozen."""
+        """Single forward/backward step for dry_run."""
         self._aggregated_x = None
-        self._aggregated_x = self._compute_aggregations()
+        if not self.train_encoder:
+            self._aggregated_x = self._compute_aggregations(use_grad=False)
         self.classifier.train()
+        if self.train_encoder:
+            self.encoder.train()
         self.optimizer.zero_grad()
         logits = self._forward_logits()
         train_mask = self.data.train_mask
         loss = F.cross_entropy(logits[train_mask], self.data.y[train_mask])
+        agg_str = f"aggregated shape={tuple(self._aggregated_x.shape)}, " if self._aggregated_x is not None else ""
         self._log(
-            f"[GAP dry] aggregated shape={tuple(self._aggregated_x.shape)}, "
+            f"[GAP dry] {agg_str}"
             f"logits shape={tuple(logits.shape)}, loss={loss.item():.4f}"
         )
         loss.backward()
         total_norm_sq: Tensor = torch.tensor(0.0, device=self.device)
-        for p in self.classifier.parameters():
-            if p.grad is not None:
+        params = list(self.classifier.parameters())
+        if self.train_encoder:
+            params = list(self.encoder.parameters()) + params
+        for p in params:
+            if p.requires_grad and p.grad is not None:
                 total_norm_sq += p.grad.detach().pow(2).sum()
         grad_norm = float(total_norm_sq.sqrt().item())
         self._log(f"[GAP dry] grad_norm={grad_norm:.4f}")

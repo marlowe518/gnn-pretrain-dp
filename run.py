@@ -154,11 +154,23 @@ def main():
         action="store_true",
         help="Run additional GAP resampling sanity check (debug-only, cheap).",
     )
+    parser.add_argument(
+        "--finetune_train_encoder",
+        action="store_true",
+        help="Finetune encoder + head (full finetune). Mutually exclusive with --finetune_freeze_encoder.",
+    )
+    parser.add_argument(
+        "--finetune_freeze_encoder",
+        action="store_true",
+        help="Freeze encoder, train head only (linear probe). Mutually exclusive with --finetune_train_encoder.",
+    )
 
     args = parser.parse_args()
 
     if args.dry_run and args.smoke_test:
         raise ValueError("Use only one of --dry_run or --smoke_test.")
+    if args.finetune_train_encoder and args.finetune_freeze_encoder:
+        raise ValueError("Cannot set both --finetune_train_encoder and --finetune_freeze_encoder.")
 
     set_seeds(args.seed)
 
@@ -191,6 +203,23 @@ def main():
     gap_debug = bool(args.gap_debug or config.get("gap_debug", False))
     gap_debug_strict = bool(args.gap_debug_strict)
     gap_debug_resample_check = bool(args.gap_debug_resample_check)
+
+    # Resolve train_encoder: CLI overrides config; else backend default.
+    cfg_train = config.get("finetune_train_encoder")
+    cfg_freeze = config.get("finetune_freeze_encoder")
+    if cfg_train is not None and cfg_freeze is not None and cfg_train and cfg_freeze:
+        raise ValueError("Config cannot set both finetune_train_encoder and finetune_freeze_encoder to true.")
+    if args.finetune_train_encoder:
+        train_encoder = True
+    elif args.finetune_freeze_encoder:
+        train_encoder = False
+    elif cfg_train is not None and cfg_train:
+        train_encoder = True
+    elif cfg_freeze is not None and cfg_freeze:
+        train_encoder = False
+    else:
+        train_encoder = True if args.finetune_backend == "vanilla" else False
+    logger(f"finetune_backend={args.finetune_backend}, train_encoder={train_encoder}")
 
     if args.smoke_test:
         pretrain_epochs = int(config.get("smoke_pretrain_epochs", 2))
@@ -272,6 +301,7 @@ def main():
             gap_debug=gap_debug,
             gap_debug_strict=gap_debug_strict,
             gap_debug_resample_check=gap_debug_resample_check,
+            train_encoder=train_encoder,
         )
     else:
         finetune_trainer = NodeClassificationTrainer(
@@ -282,6 +312,7 @@ def main():
             weight_decay=float(config.get("weight_decay", 5e-4)),
             device=device,
             logger=logger,
+            train_encoder=train_encoder,
         )
 
     if args.dry_run:
