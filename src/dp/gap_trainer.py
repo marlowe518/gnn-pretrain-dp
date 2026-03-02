@@ -2,7 +2,7 @@
 GAP (Graph Aggregation Perturbation) DP finetuning trainer.
 Reuses PMA from external/GAP for edge-level or node-level DP (AP + DP-SGD).
 """
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -11,9 +11,9 @@ from torch.optim import Adam
 from torch_geometric.data import Data
 
 from src.dp.bounded_degree_sampling import sample_bounded_degree_edge_index
-from src.dp.dp_sgd import add_noise_and_set_grads, clip_and_accumulate_grads
 from src.dp.gap_sensitivity import compute_gap_sensitivity
 from src.dp.gap_utils import get_pma_class, sparse_aggregate
+from src.dp.optim.dp_sgd import DPSGD
 from src.eval.metrics import accuracy
 from src.utils.trainer import BaseTrainer
 
@@ -56,7 +56,7 @@ class GAPFinetuneTrainer(BaseTrainer):
         gap_dp_batch_size: int = 256,
         gap_dp_microbatch_size: int = 64,
         gap_dp_delta: float = 1e-5,
-        gap_dp_params: bool = True,
+        gap_dp_params: str = "head_only",
     ) -> None:
         self.encoder = encoder.to(device)
         self.train_encoder = bool(train_encoder)
@@ -90,7 +90,9 @@ class GAPFinetuneTrainer(BaseTrainer):
         self.gap_dp_batch_size = int(gap_dp_batch_size)
         self.gap_dp_microbatch_size = int(gap_dp_microbatch_size)
         self.gap_dp_delta = float(gap_dp_delta)
-        self.gap_dp_params = bool(gap_dp_params)
+        self.gap_dp_params_mode = str(gap_dp_params).lower()
+        if self.gap_dp_params_mode not in ("head_only", "full_model"):
+            self.gap_dp_params_mode = "head_only"
         self._gap_sensitivity = compute_gap_sensitivity(
             self.gap_privacy, self.gap_max_degree, self.hops
         )
@@ -124,14 +126,32 @@ class GAPFinetuneTrainer(BaseTrainer):
             self.logger(f"[GAP] PMA calibrated: epsilon={epsilon}, delta={delta_val}, noise_scale={self.pma.noise_scale:.4f}")
 
         self.classifier = nn.Linear((hops + 1) * hidden_dim, num_classes).to(device)
-        if self.train_encoder:
-            self.optimizer = Adam(
-                list(self.encoder.parameters()) + list(self.classifier.parameters()),
+        # Optimizer: edge-DP uses standard Adam; node-DP uses DPSGD on a selected param subset.
+        if self.gap_privacy == "node":
+            if self.gap_dp_params_mode == "full_model" and self.train_encoder:
+                dp_params = list(self.encoder.parameters()) + list(self.classifier.parameters())
+            else:
+                dp_params = list(self.classifier.parameters())
+            self.dp_optimizer = DPSGD(
+                dp_params,
                 lr=lr,
+                clip_norm=self.gap_clip_norm,
+                noise_multiplier=self.gap_noise_multiplier,
+                microbatch_size=self.gap_dp_microbatch_size,
+                device=self.device,
                 weight_decay=weight_decay,
             )
+            # For node-DP we still keep an Adam instance for non-DP cases if needed, but training uses dp_optimizer.
+            self.optimizer = None
         else:
-            self.optimizer = Adam(self.classifier.parameters(), lr=lr, weight_decay=weight_decay)
+            if self.train_encoder:
+                self.optimizer = Adam(
+                    list(self.encoder.parameters()) + list(self.classifier.parameters()),
+                    lr=lr,
+                    weight_decay=weight_decay,
+                )
+            else:
+                self.optimizer = Adam(self.classifier.parameters(), lr=lr, weight_decay=weight_decay)
 
     def _log(self, msg: str) -> None:
         if self.logger is not None:
@@ -266,6 +286,11 @@ class GAPFinetuneTrainer(BaseTrainer):
         return torch.stack(noisy_list, dim=-1)
 
     def _get_aggregated_features(self) -> Tensor:
+        # For node-DP we avoid long-lived caching so that resampling and noise
+        # are correctly reflected in each step.
+        if self.gap_privacy == "node":
+            use_grad = self.train_encoder and (self.encoder.training or self.classifier.training)
+            return self._compute_aggregations(use_grad=use_grad)
         if self.train_encoder and (self.encoder.training or self.classifier.training):
             return self._compute_aggregations(use_grad=True)
         if self.train_encoder:
@@ -312,6 +337,8 @@ class GAPFinetuneTrainer(BaseTrainer):
         self.classifier.train()
         if self.train_encoder:
             self.encoder.train()
+        if self.optimizer is None:
+            raise RuntimeError("Optimizer is not configured for edge-DP training.")
         self.optimizer.zero_grad()
         logits = self._forward_logits()
         train_mask = self.data.train_mask
@@ -322,8 +349,8 @@ class GAPFinetuneTrainer(BaseTrainer):
         return self._last_train_loss
 
     def _node_dp_epoch_step(self, epoch: int) -> float:
-        """One epoch of DP-SGD: resample subgraph, then microbatch loop with clip + noise."""
-        # Resample bounded-degree edge index for this epoch
+        """One epoch of DP-SGD: resample subgraph, then microbatch loop handled by DPSGD."""
+        # Resample bounded-degree edge index for this epoch.
         self.edge_index_used = sample_bounded_degree_edge_index(
             self.data.edge_index,
             self.data.num_nodes,
@@ -333,19 +360,16 @@ class GAPFinetuneTrainer(BaseTrainer):
         self._aggregated_x = None
 
         self.classifier.train()
-        if self.train_encoder and self.gap_dp_params:
+        if self.train_encoder and self.gap_dp_params_mode == "full_model":
             self.encoder.train()
-        else:
+        elif self.train_encoder:
+            # Encoder exists but we are in head_only DP mode.
             self.encoder.eval()
 
         train_idx = self.data.train_mask.nonzero(as_tuple=False).squeeze(-1)
         n_train = train_idx.size(0)
         batch_size = min(self.gap_dp_batch_size, n_train)
         micro = self.gap_dp_microbatch_size
-        params = list(self.classifier.parameters())
-        if self.gap_dp_params and self.train_encoder:
-            params = list(self.encoder.parameters()) + params
-        accumulators: Dict[nn.Parameter, Tensor] = {}
 
         perm = torch.randperm(n_train, device=self.device)
         epoch_loss = 0.0
@@ -353,27 +377,28 @@ class GAPFinetuneTrainer(BaseTrainer):
         for start in range(0, n_train, batch_size):
             end = min(start + batch_size, n_train)
             batch_idx = train_idx[perm[start:end]]
-            accumulators.clear()
-            num_microbatches = 0
+            loss_closures: List = []
             for mb_start in range(0, batch_idx.size(0), micro):
                 mb_end = min(mb_start + micro, batch_idx.size(0))
                 mb_idx = batch_idx[mb_start:mb_end]
-                self.optimizer.zero_grad()
-                logits = self._forward_logits()
-                loss = F.cross_entropy(logits[mb_idx], self.data.y[mb_idx])
-                loss.backward()
-                clip_and_accumulate_grads(params, accumulators, self.gap_clip_norm)
-                num_microbatches += 1
-            if num_microbatches > 0:
-                add_noise_and_set_grads(
-                    params,
-                    accumulators,
-                    self.gap_clip_norm,
-                    self.gap_noise_multiplier,
-                    num_microbatches,
+                mb_idx = mb_idx.clone()
+
+                def _make_closure(indices: Tensor) -> callable:
+                    def closure() -> Tensor:
+                        logits_local = self._forward_logits()
+                        return F.cross_entropy(logits_local[indices], self.data.y[indices])
+
+                    return closure
+
+                loss_closures.append(_make_closure(mb_idx))
+
+            if loss_closures:
+                avg_loss = self.dp_optimizer.step(
+                    loss_closures=loss_closures,
+                    num_microbatches=len(loss_closures),
                 )
-                self.optimizer.step()
-            epoch_loss += loss.item()
+                if avg_loss is not None:
+                    epoch_loss += float(avg_loss)
             n_batches_done += 1
 
         n_batches = max(1, n_batches_done)
@@ -385,7 +410,7 @@ class GAPFinetuneTrainer(BaseTrainer):
         if self.gap_privacy == "node":
             self._log(
                 f"[GAP] Node-DP (AP + DP-SGD): max_degree={self.gap_max_degree}, "
-                f"clip_norm={self.gap_clip_norm}, resampling each epoch."
+                f"clip_norm={self.gap_clip_norm}, resampling each epoch, dp_params={self.gap_dp_params_mode}."
             )
         if not self.train_encoder and self.gap_privacy == "edge":
             self._aggregated_x = self._compute_aggregations(use_grad=False)
