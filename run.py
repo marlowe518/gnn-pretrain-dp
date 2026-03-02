@@ -164,6 +164,12 @@ def main():
         action="store_true",
         help="Freeze encoder, train head only (linear probe). Mutually exclusive with --finetune_train_encoder.",
     )
+    parser.add_argument(
+        "--gap_encoder_type",
+        choices=["gnn", "mlp"],
+        default=None,
+        help="GAP finetune encoder type: gnn (DGI encoder) or mlp (feature-only). Default from config or gnn.",
+    )
 
     args = parser.parse_args()
 
@@ -220,6 +226,15 @@ def main():
     else:
         train_encoder = True if args.finetune_backend == "vanilla" else False
     logger(f"finetune_backend={args.finetune_backend}, train_encoder={train_encoder}")
+
+    # GAP encoder type: CLI > config > default "gnn"
+    gap_encoder_type = (
+        args.gap_encoder_type
+        if args.gap_encoder_type is not None
+        else str(config.get("gap_encoder_type", "gnn")).lower()
+    )
+    if gap_encoder_type not in ("gnn", "mlp"):
+        gap_encoder_type = "gnn"
 
     if args.smoke_test:
         pretrain_epochs = int(config.get("smoke_pretrain_epochs", 2))
@@ -287,8 +302,32 @@ def main():
                 f"epsilon={gap_epsilon}, delta={gap_delta}, hops={gap_hops}, "
                 f"config_path={config_path_abs}"
             )
+        # Extension point: pretrained encoder to use for GAP (gnn = DGI encoder; mlp = None for now).
+        gnn_encoder_ckpt = encoder  # DGI/GNN encoder (used when gap_encoder_type=="gnn")
+        mlp_encoder_ckpt = None  # Future: when pretrain_method in {"mlpinit","supervised_mlp"}, load MLP ckpt here
+        if gap_encoder_type == "gnn":
+            encoder_for_gap = gnn_encoder_ckpt
+            load_pretrained_encoder = True
+        elif gap_encoder_type == "mlp":
+            from src.models.mlp_encoder import MLPEncoder
+            encoder_for_gap = MLPEncoder(
+                in_channels=in_channels,
+                hidden_dim=hidden_dim,
+                out_dim=hidden_dim,
+                num_layers=2,
+                dropout=0.5,
+                use_bn=False,
+            )
+            # Future: if pretrain_method in {"mlpinit", "supervised_mlp"} and mlp_encoder_ckpt: load state_dict
+            load_pretrained_encoder = mlp_encoder_ckpt is not None
+        else:
+            raise ValueError(f"gap_encoder_type must be 'gnn' or 'mlp', got {gap_encoder_type!r}")
+        logger(
+            f"[FINETUNE] backend=gap, gap_encoder_type={gap_encoder_type}, "
+            f"load_pretrained_encoder={load_pretrained_encoder}"
+        )
         finetune_trainer = GAPFinetuneTrainer(
-            encoder=encoder,
+            encoder=encoder_for_gap,
             num_classes=num_classes,
             data=data,
             lr=float(config.get("learning_rate_finetune", 1e-2)),
@@ -302,6 +341,7 @@ def main():
             gap_debug_strict=gap_debug_strict,
             gap_debug_resample_check=gap_debug_resample_check,
             train_encoder=train_encoder,
+            gap_encoder_type=gap_encoder_type,
         )
     else:
         finetune_trainer = NodeClassificationTrainer(

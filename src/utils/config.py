@@ -22,6 +22,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "gap_epsilon": 1.0,
     "gap_delta": "auto",
     "gap_hops": 2,
+    "gap_encoder_type": "gnn",
     "gap_debug": False,
 }
 

@@ -12,19 +12,25 @@ from torch_geometric.data import Data
 
 from src.dp.gap_utils import get_pma_class, sparse_aggregate
 from src.eval.metrics import accuracy
-from src.models.gnn_encoder import GCNEncoder
 from src.utils.trainer import BaseTrainer
+
+
+def _encoder_hidden_dim(encoder: nn.Module) -> int:
+    """Return encoder output dimension (GCNEncoder or MLPEncoder)."""
+    if hasattr(encoder, "conv2") and hasattr(encoder.conv2, "out_channels"):
+        return encoder.conv2.out_channels
+    return int(getattr(encoder, "out_channels", None) or getattr(encoder, "hidden_dim", 0))
 
 
 class GAPFinetuneTrainer(BaseTrainer):
     """
     DP finetuning via GAP: pretrained encoder + PMA-perturbed aggregation + classifier.
-    Encoder weights are loaded (from caller); aggregation uses GAP's PMA for edge DP.
+    Encoder can be GNN (DGI) or MLP; aggregation uses GAP's PMA for edge DP.
     """
 
     def __init__(
         self,
-        encoder: GCNEncoder,
+        encoder: nn.Module,
         num_classes: int,
         data: Data,
         lr: float,
@@ -39,9 +45,13 @@ class GAPFinetuneTrainer(BaseTrainer):
         gap_debug_strict: bool = False,
         gap_debug_resample_check: bool = False,
         train_encoder: bool = False,
+        gap_encoder_type: str = "gnn",
     ) -> None:
         self.encoder = encoder.to(device)
         self.train_encoder = bool(train_encoder)
+        self.gap_encoder_type = str(gap_encoder_type).lower()
+        if self.gap_encoder_type not in ("gnn", "mlp"):
+            self.gap_encoder_type = "gnn"
         if not self.train_encoder:
             self.encoder.eval()
             for p in self.encoder.parameters():
@@ -59,7 +69,9 @@ class GAPFinetuneTrainer(BaseTrainer):
         self.gap_debug_resample_check = bool(gap_debug_resample_check and gap_debug)
         self._debug_resample_done: bool = False
 
-        hidden_dim = encoder.conv2.out_channels
+        hidden_dim = _encoder_hidden_dim(encoder)
+        if hidden_dim <= 0:
+            raise ValueError("Encoder must expose out_channels or hidden_dim for GAP.")
         self.hidden_dim = hidden_dim
         self.num_classes = num_classes
         self._aggregated_x: Optional[Tensor] = None
