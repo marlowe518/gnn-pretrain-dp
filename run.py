@@ -170,6 +170,25 @@ def main():
         default=None,
         help="GAP finetune encoder type: gnn (DGI encoder) or mlp (feature-only). Default from config or gnn.",
     )
+    parser.add_argument(
+        "--gap_privacy",
+        choices=["edge", "node"],
+        default=None,
+        help="GAP privacy: edge (AP only) or node (AP + DP-SGD). Default from config or edge.",
+    )
+    parser.add_argument("--gap_max_degree", type=int, default=None, help="Max degree for node-DP bounded sampling.")
+    parser.add_argument("--gap_clip_norm", type=float, default=None, help="DP-SGD gradient clip norm (L2).")
+    parser.add_argument("--gap_noise_multiplier", type=float, default=None, help="DP-SGD noise multiplier (sigma).")
+    parser.add_argument("--gap_dp_batch_size", type=int, default=None, help="DP-SGD batch size (lot size).")
+    parser.add_argument("--gap_dp_microbatch_size", type=int, default=None, help="DP-SGD microbatch size.")
+    parser.add_argument("--gap_dp_delta", type=float, default=None, help="DP-SGD delta (for (eps,delta)-DP).")
+    parser.add_argument(
+        "--gap_dp_params",
+        action="store_true",
+        default=None,
+        help="Include encoder in DP-SGD (node-DP). Default from config.",
+    )
+    parser.add_argument("--no_gap_dp_params", action="store_true", help="Exclude encoder from DP-SGD (head only).")
 
     args = parser.parse_args()
 
@@ -177,6 +196,8 @@ def main():
         raise ValueError("Use only one of --dry_run or --smoke_test.")
     if args.finetune_train_encoder and args.finetune_freeze_encoder:
         raise ValueError("Cannot set both --finetune_train_encoder and --finetune_freeze_encoder.")
+    if getattr(args, "gap_dp_params", False) and getattr(args, "no_gap_dp_params", False):
+        raise ValueError("Cannot set both --gap_dp_params and --no_gap_dp_params.")
 
     set_seeds(args.seed)
 
@@ -322,6 +343,42 @@ def main():
             load_pretrained_encoder = mlp_encoder_ckpt is not None
         else:
             raise ValueError(f"gap_encoder_type must be 'gnn' or 'mlp', got {gap_encoder_type!r}")
+        # Node-DP (AP + DP-SGD) params: CLI overrides config; defaults for edge-only
+        gap_privacy = (
+            args.gap_privacy if args.gap_privacy is not None else str(config.get("gap_privacy", "edge")).lower()
+        )
+        if gap_privacy not in ("edge", "node"):
+            gap_privacy = "edge"
+        gap_max_degree = int(config.get("gap_max_degree", 10)) if args.gap_max_degree is None else args.gap_max_degree
+        gap_clip_norm = float(config.get("gap_clip_norm", 1.0)) if args.gap_clip_norm is None else args.gap_clip_norm
+        gap_noise_multiplier = (
+            float(config.get("gap_noise_multiplier", 1.0))
+            if args.gap_noise_multiplier is None
+            else args.gap_noise_multiplier
+        )
+        gap_dp_batch_size = (
+            int(config.get("gap_dp_batch_size", 256)) if args.gap_dp_batch_size is None else args.gap_dp_batch_size
+        )
+        gap_dp_microbatch_size = (
+            int(config.get("gap_dp_microbatch_size", 64))
+            if args.gap_dp_microbatch_size is None
+            else args.gap_dp_microbatch_size
+        )
+        gap_dp_delta = (
+            float(config.get("gap_dp_delta", 1e-5)) if args.gap_dp_delta is None else args.gap_dp_delta
+        )
+        if args.gap_dp_params:
+            gap_dp_params = True
+        elif args.no_gap_dp_params:
+            gap_dp_params = False
+        else:
+            gap_dp_params = bool(config.get("gap_dp_params", True))
+        if gap_privacy == "node":
+            logger(
+                f"[GAP-DP] privacy=node, max_degree={gap_max_degree}, clip_norm={gap_clip_norm}, "
+                f"noise_mult={gap_noise_multiplier}, batch={gap_dp_batch_size}, microbatch={gap_dp_microbatch_size}, "
+                f"delta={gap_dp_delta}, dp_params={gap_dp_params}"
+            )
         logger(
             f"[FINETUNE] backend=gap, gap_encoder_type={gap_encoder_type}, "
             f"load_pretrained_encoder={load_pretrained_encoder}"
@@ -342,6 +399,14 @@ def main():
             gap_debug_resample_check=gap_debug_resample_check,
             train_encoder=train_encoder,
             gap_encoder_type=gap_encoder_type,
+            gap_privacy=gap_privacy,
+            gap_max_degree=gap_max_degree,
+            gap_clip_norm=gap_clip_norm,
+            gap_noise_multiplier=gap_noise_multiplier,
+            gap_dp_batch_size=gap_dp_batch_size,
+            gap_dp_microbatch_size=gap_dp_microbatch_size,
+            gap_dp_delta=gap_dp_delta,
+            gap_dp_params=gap_dp_params,
         )
     else:
         finetune_trainer = NodeClassificationTrainer(

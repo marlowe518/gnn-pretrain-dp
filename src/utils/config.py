@@ -24,6 +24,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "gap_hops": 2,
     "gap_encoder_type": "gnn",
     "gap_debug": False,
+    # Node-DP (AP + DP-SGD); only used when gap_privacy == "node"
+    "gap_privacy": "edge",
+    "gap_max_degree": 10,
+    "gap_clip_norm": 1.0,
+    "gap_noise_multiplier": 1.0,
+    "gap_dp_batch_size": 256,
+    "gap_dp_microbatch_size": 64,
+    "gap_dp_delta": 1e-5,
+    "gap_dp_params": True,
 }
 
 
