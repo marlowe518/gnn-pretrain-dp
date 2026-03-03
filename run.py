@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from src.data.datasets import add_or_load_splits, load_planetoid
+from src.data import load_ogbn_arxiv_disjoint
 from src.finetune.node_classifier_trainer import NodeClassificationTrainer
 from src.models.dgi import build_dgi_model
 from src.pretrain.dgi_trainer import DGIPretrainer
@@ -130,7 +131,12 @@ def main():
         help="Run a short training run (1-3 epochs) for verification.",
     )
     parser.add_argument("--config", type=str, default=None, help="Path to JSON config.")
-    parser.add_argument("--dataset", type=str, default=None, help="Dataset name (e.g. Cora). Overrides config.")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Dataset name (e.g. Cora, ogbn-arxiv-disjoint). Overrides config.",
+    )
     parser.add_argument("--run_id", type=str, default=None, help="Optional run id.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument(
@@ -224,6 +230,28 @@ def main():
     parser.add_argument("--dpgnn_max_epsilon", type=float, default=None, help="DP-GNN max epsilon (early stop).")
     parser.add_argument("--dpgnn_train_encoder", action="store_true", help="DP-GNN: train encoder.")
     parser.add_argument("--dpgnn_optimizer", choices=["sgd", "adam"], default=None, help="DP-GNN base optimizer.")
+    parser.add_argument(
+        "--dpgnn_num_training_steps",
+        type=int,
+        default=None,
+        help="DP-GNN total number of DP-SGD steps (default 3000).",
+    )
+    parser.add_argument(
+        "--dpgnn_evaluate_every_steps",
+        type=int,
+        default=None,
+        help="DP-GNN evaluation interval in steps (default 50).",
+    )
+    parser.add_argument(
+        "--dpgnn_use_upstream_arch",
+        action="store_true",
+        help="Use upstream-style DP-GCN encoder instead of pretrained encoder.",
+    )
+    parser.add_argument(
+        "--dpgnn_resample_adjacency",
+        action="store_true",
+        help="Resample degree-bounded adjacency periodically (default False = fixed).",
+    )
 
     args = parser.parse_args()
 
@@ -300,24 +328,31 @@ def main():
     # Data
     dataset_name = args.dataset if args.dataset is not None else config.get("dataset", "Cora")
     _ds_lower = dataset_name.lower() if dataset_name else ""
-    if _ds_lower == "cora":
-        dataset_name = "Cora"
-    elif _ds_lower == "citeseer":
-        dataset_name = "CiteSeer"
-    elif _ds_lower == "pubmed":
-        dataset_name = "PubMed"
-    data, in_channels, num_classes = load_planetoid(dataset_name)
-    splits_cache_dir = Path("outputs") / "splits"
-    data = add_or_load_splits(
-        data=data,
-        dataset_name=dataset_name,
-        seed=args.seed,
-        cache_dir=splits_cache_dir,
-    )
-    logger(
-        f"Loaded dataset {dataset_name} with "
-        f"{data.num_nodes} nodes, {data.num_edges} edges."
-    )
+    if _ds_lower == "ogbn-arxiv-disjoint":
+        data, in_channels, num_classes = load_ogbn_arxiv_disjoint(root="data")
+        logger(
+            f"Loaded dataset {dataset_name} with "
+            f"{data.num_nodes} nodes, {data.num_edges} edges (disjoint splits)."
+        )
+    else:
+        if _ds_lower == "cora":
+            dataset_name = "Cora"
+        elif _ds_lower == "citeseer":
+            dataset_name = "CiteSeer"
+        elif _ds_lower == "pubmed":
+            dataset_name = "PubMed"
+        data, in_channels, num_classes = load_planetoid(dataset_name)
+        splits_cache_dir = Path("outputs") / "splits"
+        data = add_or_load_splits(
+            data=data,
+            dataset_name=dataset_name,
+            seed=args.seed,
+            cache_dir=splits_cache_dir,
+        )
+        logger(
+            f"Loaded dataset {dataset_name} with "
+            f"{data.num_nodes} nodes, {data.num_edges} edges."
+        )
 
     # Models
     hidden_dim = int(config.get("hidden_dim", 64))
@@ -530,11 +565,28 @@ def main():
         )
         if dpgnn_optimizer not in ("sgd", "adam"):
             dpgnn_optimizer = "sgd"
+        dpgnn_num_training_steps = int(
+            config.get("dpgnn_num_training_steps", 3000)
+            if args.dpgnn_num_training_steps is None
+            else args.dpgnn_num_training_steps
+        )
+        dpgnn_evaluate_every_steps = int(
+            config.get("dpgnn_evaluate_every_steps", 50)
+            if args.dpgnn_evaluate_every_steps is None
+            else args.dpgnn_evaluate_every_steps
+        )
+        dpgnn_use_upstream_arch = bool(
+            config.get("dpgnn_use_upstream_arch", True) or args.dpgnn_use_upstream_arch
+        )
+        dpgnn_resample_adjacency = bool(
+            config.get("dpgnn_resample_adjacency", False) or args.dpgnn_resample_adjacency
+        )
         logger(
             f"[DP-GNN] hops={dpgnn_hops}, max_degree={dpgnn_max_degree}, "
             f"batch={dpgnn_dp_batch_size}, microbatch={dpgnn_dp_microbatch_size}, "
             f"noise_mult={dpgnn_noise_multiplier}, clip_mode={dpgnn_clip_mode}, "
-            f"train_encoder={dpgnn_train_encoder}"
+            f"train_encoder={dpgnn_train_encoder}, steps={dpgnn_num_training_steps}, "
+            f"eval_every={dpgnn_evaluate_every_steps}"
         )
         finetune_trainer = DPGNNTrainer(
             encoder=encoder,
@@ -559,6 +611,10 @@ def main():
             dpgnn_max_epsilon=dpgnn_max_epsilon,
             dpgnn_train_encoder=dpgnn_train_encoder,
             dpgnn_optimizer=dpgnn_optimizer,
+            dpgnn_num_training_steps=dpgnn_num_training_steps,
+            dpgnn_evaluate_every_steps=dpgnn_evaluate_every_steps,
+            dpgnn_use_upstream_arch=dpgnn_use_upstream_arch,
+            dpgnn_resample_adjacency=dpgnn_resample_adjacency,
         )
     else:
         finetune_trainer = NodeClassificationTrainer(

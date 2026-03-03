@@ -39,6 +39,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "dpgnn_pad_to": 0,
     "dpgnn_dp_batch_size": 256,
     "dpgnn_dp_microbatch_size": 1,
+    "dpgnn_num_training_steps": 3000,
+    "dpgnn_evaluate_every_steps": 50,
     "dpgnn_noise_multiplier": 1.0,
     "dpgnn_delta": "auto",
     "dpgnn_clip_mode": "fixed",
@@ -48,6 +50,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "dpgnn_max_epsilon": 10.0,
     "dpgnn_train_encoder": False,
     "dpgnn_optimizer": "sgd",
+    "dpgnn_use_upstream_arch": True,
+    "dpgnn_resample_adjacency": False,
 }
 
 

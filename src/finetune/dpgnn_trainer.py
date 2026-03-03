@@ -75,6 +75,10 @@ class DPGNNTrainer(BaseTrainer):
         dpgnn_max_epsilon: float = 10.0,
         dpgnn_train_encoder: bool = False,
         dpgnn_optimizer: str = "sgd",
+        dpgnn_num_training_steps: int = 3000,
+        dpgnn_evaluate_every_steps: int = 50,
+        dpgnn_use_upstream_arch: bool = True,
+        dpgnn_resample_adjacency: bool = False,
     ) -> None:
         self.encoder = encoder.to(device)
         self.data = data.to(device)
@@ -98,6 +102,10 @@ class DPGNNTrainer(BaseTrainer):
         self.dpgnn_max_epsilon = dpgnn_max_epsilon
         self.dpgnn_train_encoder = dpgnn_train_encoder
         self.dpgnn_optimizer = dpgnn_optimizer
+        self.dpgnn_num_training_steps = int(dpgnn_num_training_steps)
+        self.dpgnn_evaluate_every_steps = int(dpgnn_evaluate_every_steps)
+        self.dpgnn_use_upstream_arch = bool(dpgnn_use_upstream_arch)
+        self.dpgnn_resample_adjacency = bool(dpgnn_resample_adjacency)
 
         # Hidden dim from encoder (GCNEncoder has conv2.out_channels)
         hidden_dim = getattr(encoder, "conv2", None)
@@ -213,53 +221,55 @@ class DPGNNTrainer(BaseTrainer):
         """Upstream: train loop with batch sampling, per-example grads, DP step, epsilon check."""
         n_train = int(self.data.train_mask.sum().item())
         train_idx = self.data.train_mask.nonzero(as_tuple=False).squeeze(-1)
-        steps_per_epoch = max(1, (n_train + self.dpgnn_dp_batch_size - 1) // self.dpgnn_dp_batch_size)
         total_steps = 0
 
         train_metrics = self.evaluate("train")
         val_metrics = self.evaluate("val")
 
+        # Fixed degree-bounded adjacency unless explicit resampling requested.
+        dropped = self.sampler.resample(seed=0)
+        self._log(f"[DP-GNN] Initial degree-bounded adjacency, dropped_nodes={dropped}")
+
         if self.dpgnn_clip_mode == "percentile":
             t0 = time.perf_counter()
-            self.sampler.resample(seed=0)
             self._estimate_clip_percentiles(seed=42)
             self._log(f"[DP-GNN] clip percentile estimation done in {time.perf_counter() - t0:.2f}s")
 
-        for epoch in range(1, num_epochs + 1):
-            self.sampler.resample(seed=epoch)
-            dropped = self.sampler.dropped_count
-            self._log(f"[DP-GNN] Epoch {epoch} resampled adjacency, dropped_nodes={dropped}")
+        while total_steps < self.dpgnn_num_training_steps:
+            if self.dpgnn_resample_adjacency:
+                dropped = self.sampler.resample(seed=total_steps + 1)
+                self._log(f"[DP-GNN] Resampled adjacency at step {total_steps+1}, dropped_nodes={dropped}")
 
-            perm = torch.randperm(n_train, device=self.device)
-            epoch_loss = 0.0
-            n_batches = 0
+            # Sample roots: for large batch sizes, use all train nodes shuffled.
+            if self.dpgnn_dp_batch_size >= n_train:
+                perm = torch.randperm(n_train, device=self.device)
+                roots = train_idx[perm]
+            else:
+                perm = torch.randperm(n_train, device=self.device)[: self.dpgnn_dp_batch_size]
+                roots = train_idx[perm]
 
-            for b in range(0, n_train, self.dpgnn_dp_batch_size):
-                batch_idx = train_idx[perm[b : b + self.dpgnn_dp_batch_size]]
-                roots = batch_idx
+            per_example_grads: List[Dict[nn.Parameter, Tensor]] = []
+            batch_losses: List[float] = []
 
-                # Per-example gradients: one subgraph per root, loss at root
-                per_example_grads: List[Dict[nn.Parameter, Tensor]] = []
-                batch_losses = []
+            for start in range(0, roots.size(0), self.dpgnn_dp_microbatch_size):
+                mb = roots[start : start + self.dpgnn_dp_microbatch_size]
+                subs = self.sampler.get_subgraph(mb, self.data.x)
+                for i, (sub_x, sub_edge_index, _) in enumerate(subs):
+                    if start + i >= roots.size(0):
+                        break
+                    root = roots[start + i].item()
+                    self.dp_optimizer.zero_grad()
+                    loss = self._loss_at_root(sub_x, sub_edge_index, self.data.y[root : root + 1])
+                    loss.backward()
+                    batch_losses.append(loss.item())
+                    grad_dict = {
+                        p: p.grad.clone()
+                        for p in self.dp_optimizer.param_groups[0]["params"]
+                        if p.grad is not None and p.requires_grad
+                    }
+                    per_example_grads.append(grad_dict)
 
-                for start in range(0, roots.size(0), self.dpgnn_dp_microbatch_size):
-                    mb = roots[start : start + self.dpgnn_dp_microbatch_size]
-                    subs = self.sampler.get_subgraph(mb, self.data.x)
-                    for i, (sub_x, sub_edge_index, _) in enumerate(subs):
-                        if start + i >= roots.size(0):
-                            break
-                        root = roots[start + i].item()
-                        self.dp_optimizer.zero_grad()
-                        loss = self._loss_at_root(sub_x, sub_edge_index, self.data.y[root : root + 1])
-                        loss.backward()
-                        batch_losses.append(loss.item())
-                        grad_dict = {p: p.grad.clone() for p in self.dp_optimizer.param_groups[0]["params"] if p.grad is not None and p.requires_grad}
-                        per_example_grads.append(grad_dict)
-
-                if not per_example_grads:
-                    continue
-
-                # Aggregate with clip + noise and step (upstream: dp_aggregate then update)
+            if per_example_grads:
                 aggregated = clip_and_aggregate(
                     per_example_grads,
                     self.dp_optimizer.clip_norms,
@@ -269,27 +279,28 @@ class DPGNNTrainer(BaseTrainer):
                 )
                 self.dp_optimizer.step_from_aggregated_grads(aggregated)
 
-                total_steps += 1
-                self._current_epsilon = self.get_epsilon(total_steps)
-                if batch_losses:
-                    epoch_loss += sum(batch_losses) / len(batch_losses)
-                n_batches += 1
-
-                if self._current_epsilon >= self.dpgnn_max_epsilon:
-                    self._log(f"[DP-GNN] Epsilon {self._current_epsilon:.4f} >= max_epsilon {self.dpgnn_max_epsilon}, stopping.")
-                    break
+            total_steps += 1
+            if batch_losses:
+                self._last_train_loss = float(sum(batch_losses) / len(batch_losses))
+            self._current_epsilon = self.get_epsilon(total_steps)
 
             if self._current_epsilon >= self.dpgnn_max_epsilon:
+                self._log(
+                    f"[DP-GNN] Epsilon {self._current_epsilon:.4f} >= max_epsilon {self.dpgnn_max_epsilon}, stopping."
+                )
                 break
 
-            self._last_train_loss = epoch_loss / max(n_batches, 1)
-            train_metrics = self.evaluate("train")
-            val_metrics = self.evaluate("val")
-            self._log(
-                f"[DP-GNN] Epoch {epoch:03d} | loss={self._last_train_loss:.4f} | "
-                f"train_acc={train_metrics['accuracy']:.3f} | val_acc={val_metrics['accuracy']:.3f} | "
-                f"epsilon={self._current_epsilon:.4f}"
-            )
+            if (
+                total_steps % self.dpgnn_evaluate_every_steps == 0
+                or total_steps == self.dpgnn_num_training_steps
+            ):
+                train_metrics = self.evaluate("train")
+                val_metrics = self.evaluate("val")
+                self._log(
+                    f"[DP-GNN] step={total_steps:04d} | loss={self._last_train_loss:.4f} | "
+                    f"train_acc={train_metrics['accuracy']:.3f} | val_acc={val_metrics['accuracy']:.3f} | "
+                    f"epsilon={self._current_epsilon:.4f}"
+                )
 
         return {
             "train_loss": self._last_train_loss,
