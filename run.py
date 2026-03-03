@@ -20,6 +20,11 @@ try:
 except Exception:
     GAPFinetuneTrainer = None
 
+try:
+    from src.finetune.dpgnn_trainer import DPGNNTrainer
+except Exception:
+    DPGNNTrainer = None
+
 
 def set_seeds(seed: int) -> None:
     random.seed(seed)
@@ -125,6 +130,7 @@ def main():
         help="Run a short training run (1-3 epochs) for verification.",
     )
     parser.add_argument("--config", type=str, default=None, help="Path to JSON config.")
+    parser.add_argument("--dataset", type=str, default=None, help="Dataset name (e.g. Cora). Overrides config.")
     parser.add_argument("--run_id", type=str, default=None, help="Optional run id.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument(
@@ -135,9 +141,9 @@ def main():
     )
     parser.add_argument(
         "--finetune_backend",
-        choices=["vanilla", "gap"],
+        choices=["vanilla", "gap", "dpgnn"],
         default="vanilla",
-        help="Finetuning backend: vanilla (standard) or gap (DP via Graph Aggregation Perturbation).",
+        help="Finetuning backend: vanilla, gap (GAP DP), or dpgnn (DP-GNN).",
     )
     parser.add_argument(
         "--gap_debug",
@@ -198,6 +204,26 @@ def main():
         default=None,
         help="Which parameters are updated by DP-SGD: head_only (classifier) or full_model (encoder+head).",
     )
+    # DP-GNN backend (upstream: google-research/differentially_private_gnns)
+    parser.add_argument("--dpgnn_hops", type=int, default=None, help="DP-GNN message passing hops (0=MLP, 1 or 2).")
+    parser.add_argument("--dpgnn_max_degree", type=int, default=None, help="DP-GNN max in-degree for sampling.")
+    parser.add_argument("--dpgnn_pad_to", type=int, default=None, help="DP-GNN subgraph padding size (0=no padding).")
+    parser.add_argument("--dpgnn_dp_batch_size", type=int, default=None, help="DP-GNN batch size.")
+    parser.add_argument("--dpgnn_dp_microbatch_size", type=int, default=None, help="DP-GNN microbatch size.")
+    parser.add_argument("--dpgnn_noise_multiplier", type=float, default=None, help="DP-GNN noise multiplier.")
+    parser.add_argument("--dpgnn_delta", type=float, default=None, help="DP-GNN delta (auto=1/(10*N_train)).")
+    parser.add_argument(
+        "--dpgnn_clip_mode",
+        choices=["fixed", "percentile"],
+        default=None,
+        help="DP-GNN clip: fixed norm or percentile-estimated.",
+    )
+    parser.add_argument("--dpgnn_clip_norm", type=float, default=None, help="DP-GNN fixed clip norm.")
+    parser.add_argument("--dpgnn_clip_percentile", type=float, default=None, help="DP-GNN clip percentile.")
+    parser.add_argument("--dpgnn_num_estimation_samples", type=int, default=None, help="DP-GNN samples for percentile.")
+    parser.add_argument("--dpgnn_max_epsilon", type=float, default=None, help="DP-GNN max epsilon (early stop).")
+    parser.add_argument("--dpgnn_train_encoder", action="store_true", help="DP-GNN: train encoder.")
+    parser.add_argument("--dpgnn_optimizer", choices=["sgd", "adam"], default=None, help="DP-GNN base optimizer.")
 
     args = parser.parse_args()
 
@@ -272,7 +298,14 @@ def main():
         finetune_epochs = int(config.get("finetune_epochs", 200))
 
     # Data
-    dataset_name = config.get("dataset", "Cora")
+    dataset_name = args.dataset if args.dataset is not None else config.get("dataset", "Cora")
+    _ds_lower = dataset_name.lower() if dataset_name else ""
+    if _ds_lower == "cora":
+        dataset_name = "Cora"
+    elif _ds_lower == "citeseer":
+        dataset_name = "CiteSeer"
+    elif _ds_lower == "pubmed":
+        dataset_name = "PubMed"
     data, in_channels, num_classes = load_planetoid(dataset_name)
     splits_cache_dir = Path("outputs") / "splits"
     data = add_or_load_splits(
@@ -429,6 +462,103 @@ def main():
             gap_dp_microbatch_size=gap_dp_microbatch_size,
             gap_dp_delta=gap_dp_delta,
             gap_dp_params=gap_dp_params,
+        )
+    elif args.finetune_backend == "dpgnn":
+        if DPGNNTrainer is None:
+            raise RuntimeError(
+                "DP-GNN backend requested but src.finetune.dpgnn_trainer could not be loaded."
+            )
+        dpgnn_hops = int(config.get("dpgnn_hops", 1) if args.dpgnn_hops is None else args.dpgnn_hops)
+        dpgnn_max_degree = int(
+            config.get("dpgnn_max_degree", 10) if args.dpgnn_max_degree is None else args.dpgnn_max_degree
+        )
+        dpgnn_pad_to = int(config.get("dpgnn_pad_to", 0) if args.dpgnn_pad_to is None else args.dpgnn_pad_to)
+        dpgnn_dp_batch_size = int(
+            config.get("dpgnn_dp_batch_size", 256)
+            if args.dpgnn_dp_batch_size is None
+            else args.dpgnn_dp_batch_size
+        )
+        dpgnn_dp_microbatch_size = int(
+            config.get("dpgnn_dp_microbatch_size", 1)
+            if args.dpgnn_dp_microbatch_size is None
+            else args.dpgnn_dp_microbatch_size
+        )
+        dpgnn_noise_multiplier = float(
+            config.get("dpgnn_noise_multiplier", 1.0)
+            if args.dpgnn_noise_multiplier is None
+            else args.dpgnn_noise_multiplier
+        )
+        dpgnn_delta_cfg = config.get("dpgnn_delta", "auto")
+        if args.dpgnn_delta is not None:
+            dpgnn_delta = args.dpgnn_delta
+        elif isinstance(dpgnn_delta_cfg, (int, float)):
+            dpgnn_delta = float(dpgnn_delta_cfg)
+        else:
+            dpgnn_delta = "auto"
+        dpgnn_clip_mode = (
+            args.dpgnn_clip_mode
+            if args.dpgnn_clip_mode is not None
+            else str(config.get("dpgnn_clip_mode", "fixed")).lower()
+        )
+        if dpgnn_clip_mode not in ("fixed", "percentile"):
+            dpgnn_clip_mode = "fixed"
+        dpgnn_clip_norm = float(
+            config.get("dpgnn_clip_norm", 1.0) if args.dpgnn_clip_norm is None else args.dpgnn_clip_norm
+        )
+        dpgnn_clip_percentile = float(
+            config.get("dpgnn_clip_percentile", 95.0)
+            if args.dpgnn_clip_percentile is None
+            else args.dpgnn_clip_percentile
+        )
+        dpgnn_num_estimation_samples = int(
+            config.get("dpgnn_num_estimation_samples", 500)
+            if args.dpgnn_num_estimation_samples is None
+            else args.dpgnn_num_estimation_samples
+        )
+        dpgnn_max_epsilon = float(
+            config.get("dpgnn_max_epsilon", 10.0)
+            if args.dpgnn_max_epsilon is None
+            else args.dpgnn_max_epsilon
+        )
+        dpgnn_train_encoder = bool(
+            config.get("dpgnn_train_encoder", False) or args.dpgnn_train_encoder
+        )
+        dpgnn_optimizer = (
+            args.dpgnn_optimizer
+            if args.dpgnn_optimizer is not None
+            else str(config.get("dpgnn_optimizer", "sgd")).lower()
+        )
+        if dpgnn_optimizer not in ("sgd", "adam"):
+            dpgnn_optimizer = "sgd"
+        logger(
+            f"[DP-GNN] hops={dpgnn_hops}, max_degree={dpgnn_max_degree}, "
+            f"batch={dpgnn_dp_batch_size}, microbatch={dpgnn_dp_microbatch_size}, "
+            f"noise_mult={dpgnn_noise_multiplier}, clip_mode={dpgnn_clip_mode}, "
+            f"train_encoder={dpgnn_train_encoder}"
+        )
+        finetune_trainer = DPGNNTrainer(
+            encoder=encoder,
+            num_classes=num_classes,
+            data=data,
+            lr=float(config.get("learning_rate_finetune", 1e-2)),
+            weight_decay=float(config.get("weight_decay", 5e-4)),
+            device=device,
+            logger=logger,
+            # DP-GNN specific
+            dpgnn_hops=dpgnn_hops,
+            dpgnn_max_degree=dpgnn_max_degree,
+            dpgnn_pad_to=dpgnn_pad_to,
+            dpgnn_dp_batch_size=dpgnn_dp_batch_size,
+            dpgnn_dp_microbatch_size=dpgnn_dp_microbatch_size,
+            dpgnn_noise_multiplier=dpgnn_noise_multiplier,
+            dpgnn_delta=dpgnn_delta,
+            dpgnn_clip_mode=dpgnn_clip_mode,
+            dpgnn_clip_norm=dpgnn_clip_norm,
+            dpgnn_clip_percentile=dpgnn_clip_percentile,
+            dpgnn_num_estimation_samples=dpgnn_num_estimation_samples,
+            dpgnn_max_epsilon=dpgnn_max_epsilon,
+            dpgnn_train_encoder=dpgnn_train_encoder,
+            dpgnn_optimizer=dpgnn_optimizer,
         )
     else:
         finetune_trainer = NodeClassificationTrainer(

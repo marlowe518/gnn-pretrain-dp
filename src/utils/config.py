@@ -33,6 +33,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "gap_dp_microbatch_size": 1,
     "gap_dp_delta": 1e-5,
     "gap_dp_params": "head_only",
+    # DP-GNN finetuning (finetune_backend=dpgnn); upstream: differentially_private_gnns
+    "dpgnn_hops": 1,
+    "dpgnn_max_degree": 10,
+    "dpgnn_pad_to": 0,
+    "dpgnn_dp_batch_size": 256,
+    "dpgnn_dp_microbatch_size": 1,
+    "dpgnn_noise_multiplier": 1.0,
+    "dpgnn_delta": "auto",
+    "dpgnn_clip_mode": "fixed",
+    "dpgnn_clip_norm": 1.0,
+    "dpgnn_clip_percentile": 95.0,
+    "dpgnn_num_estimation_samples": 500,
+    "dpgnn_max_epsilon": 10.0,
+    "dpgnn_train_encoder": False,
+    "dpgnn_optimizer": "sgd",
 }
 
 
