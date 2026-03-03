@@ -10,7 +10,7 @@ Aligned with upstream: differentially_private_gnns/train.py
 from __future__ import annotations
 
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -67,7 +67,7 @@ class DPGNNTrainer(BaseTrainer):
         dpgnn_dp_batch_size: int = 256,
         dpgnn_dp_microbatch_size: int = 1,
         dpgnn_noise_multiplier: float = 1.0,
-        dpgnn_delta: float = "auto",
+        dpgnn_delta: Union[float, str] = "auto",
         dpgnn_clip_mode: str = "fixed",
         dpgnn_clip_norm: float = 1.0,
         dpgnn_clip_percentile: float = 95.0,

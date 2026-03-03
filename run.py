@@ -217,7 +217,12 @@ def main():
     parser.add_argument("--dpgnn_dp_batch_size", type=int, default=None, help="DP-GNN batch size.")
     parser.add_argument("--dpgnn_dp_microbatch_size", type=int, default=None, help="DP-GNN microbatch size.")
     parser.add_argument("--dpgnn_noise_multiplier", type=float, default=None, help="DP-GNN noise multiplier.")
-    parser.add_argument("--dpgnn_delta", type=float, default=None, help="DP-GNN delta (auto=1/(10*N_train)).")
+    parser.add_argument(
+        "--dpgnn_delta",
+        type=str,
+        default=None,
+        help="DP-GNN delta; float value or 'auto' for 1/(10*N_train).",
+    )
     parser.add_argument(
         "--dpgnn_clip_mode",
         choices=["fixed", "percentile"],
@@ -525,9 +530,15 @@ def main():
         )
         dpgnn_delta_cfg = config.get("dpgnn_delta", "auto")
         if args.dpgnn_delta is not None:
-            dpgnn_delta = args.dpgnn_delta
+            # CLI can pass a float or 'auto'
+            if str(args.dpgnn_delta).lower() == "auto":
+                dpgnn_delta = "auto"
+            else:
+                dpgnn_delta = float(args.dpgnn_delta)
         elif isinstance(dpgnn_delta_cfg, (int, float)):
             dpgnn_delta = float(dpgnn_delta_cfg)
+        elif isinstance(dpgnn_delta_cfg, str) and dpgnn_delta_cfg.lower() == "auto":
+            dpgnn_delta = "auto"
         else:
             dpgnn_delta = "auto"
         dpgnn_clip_mode = (
