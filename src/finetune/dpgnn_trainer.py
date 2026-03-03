@@ -106,6 +106,7 @@ class DPGNNTrainer(BaseTrainer):
         self.dpgnn_evaluate_every_steps = int(dpgnn_evaluate_every_steps)
         self.dpgnn_use_upstream_arch = bool(dpgnn_use_upstream_arch)
         self.dpgnn_resample_adjacency = bool(dpgnn_resample_adjacency)
+        self.lr = float(lr)
 
         # Hidden dim from encoder (GCNEncoder has conv2.out_channels)
         hidden_dim = getattr(encoder, "conv2", None)
@@ -133,7 +134,7 @@ class DPGNNTrainer(BaseTrainer):
 
         self.dp_optimizer = DPOptimizer(
             params,
-            lr=lr,
+            lr=self.lr,
             clip_norm=dpgnn_clip_norm,
             base_sensitivity=self.base_sensitivity,
             noise_multiplier=dpgnn_noise_multiplier,
@@ -143,10 +144,14 @@ class DPGNNTrainer(BaseTrainer):
         )
 
         n_train = int(self.data.train_mask.sum().item())
-        delta = dpgnn_delta if isinstance(dpgnn_delta, (int, float)) else (1.0 / (10.0 * n_train))
-        accountant_mode = "poisson" if dpgnn_hops == 0 else "multiterm"
+        self.dp_delta_effective = (
+            float(dpgnn_delta)
+            if isinstance(dpgnn_delta, (int, float))
+            else (1.0 / (10.0 * n_train))
+        )
+        self.accountant_mode = "poisson" if dpgnn_hops == 0 else "multiterm"
         self.get_epsilon = make_accountant(
-            accountant_mode,
+            self.accountant_mode,
             n_train,
             dpgnn_dp_batch_size,
             dpgnn_noise_multiplier,
@@ -225,6 +230,16 @@ class DPGNNTrainer(BaseTrainer):
 
         train_metrics = self.evaluate("train")
         val_metrics = self.evaluate("val")
+
+        # Config check / reproducibility block.
+        self._log(
+            "[DP-GNN CONFIG CHECK] "
+            f"hops={self.dpgnn_hops}, max_degree={self.dpgnn_max_degree}, pad_to={self.dpgnn_pad_to}, "
+            f"batch_size={self.dpgnn_dp_batch_size}, microbatch_size={self.dpgnn_dp_microbatch_size}, "
+            f"noise_multiplier={self.dpgnn_noise_multiplier}, clip_mode={self.dpgnn_clip_mode}, "
+            f"clip_percentile={self.dpgnn_clip_percentile}, delta={self.dp_delta_effective}, "
+            f"optimizer={self.dpgnn_optimizer}, lr={self.lr}, accountant={self.accountant_mode}"
+        )
 
         # Fixed degree-bounded adjacency unless explicit resampling requested.
         dropped = self.sampler.resample(seed=0)

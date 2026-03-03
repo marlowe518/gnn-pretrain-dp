@@ -132,6 +132,12 @@ def main():
     )
     parser.add_argument("--config", type=str, default=None, help="Path to JSON config.")
     parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Global learning rate for finetuning (used by DP-GNN, default 3e-3).",
+    )
+    parser.add_argument(
         "--dataset",
         type=str,
         default=None,
@@ -289,6 +295,9 @@ def main():
 
     config = load_config(args.config)
     config["seed"] = args.seed
+    # Learning rate: CLI > config > default (3e-3 in DEFAULT_CONFIG, used by DP-GNN)
+    if args.lr is not None:
+        config["lr"] = float(args.lr)
     config_path = save_config(config, run_dir)
     logger(f"Config saved to {config_path}")
 
@@ -603,7 +612,7 @@ def main():
             encoder=encoder,
             num_classes=num_classes,
             data=data,
-            lr=float(config.get("learning_rate_finetune", 1e-2)),
+            lr=float(config.get("lr", 3e-3)),
             weight_decay=float(config.get("weight_decay", 5e-4)),
             device=device,
             logger=logger,

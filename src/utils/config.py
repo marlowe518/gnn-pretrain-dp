@@ -8,6 +8,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "hidden_dim": 64,
     "learning_rate_pretrain": 1e-3,
     "learning_rate_finetune": 1e-2,
+    # Global finetune LR (used by DP-GNN; others keep their legacy defaults)
+    "lr": 3e-3,
     "weight_decay": 5e-4,
     "pretrain_epochs": 50,
     "finetune_epochs": 200,
