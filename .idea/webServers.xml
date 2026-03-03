@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="b9c8d50f-1ce6-4fce-8b8e-1a5de68fa484" name="runpod">
+        <fileTransfer accessType="SFTP" sshConfigId="c32d73fb-9b98-4fd7-9b0d-7cedbf242b1b" sshConfig="runpod">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+      <webServer id="03dca255-c49e-46f8-b169-b05b61090546" name="runpod4090">
+        <fileTransfer accessType="SFTP" sshConfigId="96c0c65c-439c-4468-905c-6b8de0b848e0" sshConfig="runpod4090">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>

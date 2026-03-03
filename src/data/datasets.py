@@ -1,3 +1,4 @@
+import shutil
 from pathlib import Path
 from typing import Tuple
 
@@ -10,8 +11,20 @@ def load_planetoid(name: str, root: str = "data") -> Tuple[Data, int, int]:
     """
     Load a small citation network dataset (e.g. Cora).
     Returns (data, num_features, num_classes).
+    If the cached processed data has an incompatible format (e.g. from another PyG version),
+    the processed dir is removed and loading is retried once.
     """
-    dataset = Planetoid(root=root, name=name)
+    try:
+        dataset = Planetoid(root=root, name=name)
+    except ValueError as e:
+        if "too many values to unpack" in str(e) or "expected 2" in str(e):
+            # Incompatible processed cache; remove it and retry
+            processed_dir = Path(root) / name / "processed"
+            if processed_dir.exists():
+                shutil.rmtree(processed_dir)
+            dataset = Planetoid(root=root, name=name)
+        else:
+            raise
     data = dataset[0]
     return data, dataset.num_features, dataset.num_classes
 
