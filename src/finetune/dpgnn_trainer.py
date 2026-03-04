@@ -228,6 +228,64 @@ class DPGNNTrainer(BaseTrainer):
         train_idx = self.data.train_mask.nonzero(as_tuple=False).squeeze(-1)
         total_steps = 0
 
+        # Helper: log degree statistics for a given set of degrees.
+        def _log_degree_stats(tag: str, degrees: torch.Tensor) -> None:
+            if degrees.numel() == 0:
+                self._log(f"{tag} no nodes to report.")
+                return
+            deg = degrees.to(torch.float32)
+            num_nodes_deg = deg.numel()
+            zeros = (deg == 0).sum().item()
+            zero_ratio = float(zeros) / float(num_nodes_deg)
+            mean = deg.mean().item()
+            # Percentiles
+            q = torch.quantile(
+                deg,
+                torch.tensor([0.5, 0.9, 0.99], device=deg.device),
+            )
+            p50 = q[0].item()
+            p90 = q[1].item()
+            p99 = q[2].item()
+            max_deg = deg.max().item()
+            # Histogram 0..20 and tail
+            deg_long = degrees.to(torch.long)
+            deg_clamped = deg_long.clamp(max=20)
+            hist = torch.bincount(deg_clamped, minlength=21).cpu().tolist()
+            tail = int((deg_long > 20).sum().item())
+            self._log(
+                f"{tag} nodes={num_nodes_deg}, zero_ratio={zero_ratio:.4f}, "
+                f"mean={mean:.2f}, p50={p50:.1f}, p90={p90:.1f}, p99={p99:.1f}, "
+                f"max={max_deg:.1f}, hist_0_20={hist}, tail_gt20={tail}"
+            )
+
+        # BEFORE_SAMPLING: out-degree stats on train nodes using raw edge_index.
+        edge_index_cpu = self.data.edge_index.detach().cpu()
+        src_raw = edge_index_cpu[0]
+        dst_raw = edge_index_cpu[1]
+        num_nodes = int(self.data.num_nodes)
+        outdeg_raw_all = torch.bincount(src_raw, minlength=num_nodes)
+        train_deg_raw = outdeg_raw_all[train_idx.detach().cpu()]
+        _log_degree_stats("[BEFORE_SAMPLING]", train_deg_raw)
+
+        # EDGE_RATIO: train-train edge ratio on raw edge_index.
+        train_mask_cpu = self.data.train_mask.detach().cpu()
+        train_edge_mask = train_mask_cpu[src_raw] & train_mask_cpu[dst_raw]
+        train_train_edges = int(train_edge_mask.sum().item())
+        total_edges = int(src_raw.numel())
+        edge_ratio = float(train_train_edges) / float(total_edges) if total_edges > 0 else 0.0
+        self._log(
+            f"[EDGE_RATIO] train-train_edges={train_train_edges}, "
+            f"total_edges={total_edges}, ratio={edge_ratio:.6f}"
+        )
+
+        # Subgraph debug accumulators (early steps / microbatches only).
+        debug_edges_sum = 0.0
+        debug_nearly_empty_count = 0
+        debug_subgraph_count = 0
+        debug_microbatch_seen = 0
+        debug_microbatch_limit = 4
+        debug_step_limit = 2
+
         train_metrics = self.evaluate("train")
         val_metrics = self.evaluate("val")
 
@@ -244,6 +302,17 @@ class DPGNNTrainer(BaseTrainer):
         # Fixed degree-bounded adjacency unless explicit resampling requested.
         dropped = self.sampler.resample(seed=0)
         self._log(f"[DP-GNN] Initial degree-bounded adjacency, dropped_nodes={dropped}")
+
+        # AFTER_SAMPLING: out-degree stats on train nodes using sampled adjacency.
+        try:
+            adj = self.sampler.get_adjacency()
+        except AttributeError:
+            adj = self.sampler._adj
+        deg_after_all = torch.tensor(
+            [len(neigh) for neigh in adj], dtype=torch.long
+        )
+        train_deg_after = deg_after_all[train_idx.detach().cpu()]
+        _log_degree_stats("[AFTER_SAMPLING]", train_deg_after)
 
         if self.dpgnn_clip_mode == "percentile":
             t0 = time.perf_counter()
@@ -269,6 +338,18 @@ class DPGNNTrainer(BaseTrainer):
             for start in range(0, roots.size(0), self.dpgnn_dp_microbatch_size):
                 mb = roots[start : start + self.dpgnn_dp_microbatch_size]
                 subs = self.sampler.get_subgraph(mb, self.data.x)
+
+                # SUBGRAPH stats: first few microbatches of the first 1–2 steps only.
+                collect_debug = (
+                    total_steps < debug_step_limit
+                    and debug_microbatch_seen < debug_microbatch_limit
+                )
+                if collect_debug and len(subs) > 0:
+                    edges_counts = [sub_edge_index.size(1) for _, sub_edge_index, _ in subs]
+                    debug_subgraph_count += len(edges_counts)
+                    debug_nearly_empty_count += sum(1 for e in edges_counts if e <= 2)
+                    debug_edges_sum += float(sum(edges_counts))
+                    debug_microbatch_seen += 1
                 for i, (sub_x, sub_edge_index, _) in enumerate(subs):
                     if start + i >= roots.size(0):
                         break
@@ -316,6 +397,16 @@ class DPGNNTrainer(BaseTrainer):
                     f"train_acc={train_metrics['accuracy']:.3f} | val_acc={val_metrics['accuracy']:.3f} | "
                     f"epsilon={self._current_epsilon:.4f}"
                 )
+
+        # Log aggregated SUBGRAPH stats once.
+        if debug_subgraph_count > 0:
+            nearly_empty_ratio = debug_nearly_empty_count / float(debug_subgraph_count)
+            avg_edges = debug_edges_sum / float(debug_subgraph_count)
+            self._log(
+                f"[DP-GNN SUBGRAPH] samples={debug_subgraph_count}, "
+                f"nearly_empty_ratio={nearly_empty_ratio:.4f}, "
+                f"avg_edges={avg_edges:.2f}"
+            )
 
         return {
             "train_loss": self._last_train_loss,
